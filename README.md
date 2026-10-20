@@ -29,6 +29,14 @@ reads `.claude/review/latest.md` and works through the comments in tag order.
 
 Re-run `install-command` after upgrading to refresh the slash command.
 
+Reviews are written to `.claude/review/` in the repo. To keep them out of
+`git status` in every project, add this line to your global gitignore
+(`~/.config/git/ignore` by default):
+
+```
+**/.claude/review/
+```
+
 ## Options
 
 ```
