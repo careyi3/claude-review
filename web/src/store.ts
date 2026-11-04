@@ -1,5 +1,12 @@
 import { create } from 'zustand';
-import type { CommentTag, Draft, FileDiff, ReviewModel, Side } from './types.ts';
+import type {
+  CommentTag,
+  Draft,
+  FileDiff,
+  ReviewModel,
+  SessionSummary,
+  Side,
+} from './types.ts';
 import { EXPAND_STEP, gapKey, type Expansion } from './gaps.ts';
 import * as api from './api.ts';
 import type { Selection } from './selection.ts';
@@ -9,6 +16,18 @@ export { selectionRange } from './selection.ts';
 
 function initialViewMode(): ViewMode {
   return new URLSearchParams(window.location.search).get('view') === 'split' ? 'split' : 'unified';
+}
+
+function initialSession(): string | null {
+  return new URLSearchParams(window.location.search).get('session');
+}
+
+/** Keeps `?session=` in the address bar so a reload reopens the same session. */
+function rememberSessionInUrl(id: string | null): void {
+  const url = new URL(window.location.href);
+  if (id) url.searchParams.set('session', id);
+  else url.searchParams.delete('session');
+  window.history.replaceState(null, '', url);
 }
 
 const SIDEBAR_KEY = 'claude-review:sidebar';
@@ -30,10 +49,16 @@ function remember(key: string, value: boolean, onValue: string, offValue: string
   }
 }
 
-type Status = 'loading' | 'ready' | 'error';
+type Status = 'loading' | 'ready' | 'error' | 'gone';
 export type ViewMode = 'unified' | 'split';
 
 interface ReviewState {
+  sessions: SessionSummary[] | null;
+  sessionsError: string | null;
+  sessionId: string | null;
+  pickerOpen: boolean;
+  newSessionOpen: boolean;
+
   model: ReviewModel | null;
   draft: Draft | null;
   status: Status;
@@ -56,6 +81,14 @@ interface ReviewState {
   stale: boolean;
   expansions: Readonly<Record<string, Expansion>>;
   composingPath: string | null;
+
+  loadSessions: () => Promise<void>;
+  selectSession: (id: string | null) => void;
+  setPickerOpen: (open: boolean) => void;
+  setNewSessionOpen: (open: boolean) => void;
+  closeSession: (id: string) => Promise<void>;
+  renameSession: (id: string, name: string) => Promise<void>;
+  setSessionBase: (id: string, base: string) => Promise<void>;
 
   load: () => Promise<void>;
   setActivePath: (path: string | null) => void;
@@ -86,11 +119,32 @@ interface ReviewState {
   setOverall: (text: string) => Promise<void>;
 }
 
+const startingSession = initialSession();
+api.setApiSession(startingSession);
+
+/** Per-session view state, reset whenever the session changes. */
+const FRESH_VIEW = {
+  model: null,
+  draft: null,
+  error: null,
+  saveError: null,
+  activePath: null,
+  collapsed: new Set<string>() as ReadonlySet<string>,
+  selection: null,
+  preview: null,
+  submitResult: null,
+  stale: false,
+  expansions: {},
+  composingPath: null,
+} as const;
+
 export const useReview = create<ReviewState>((set, get) => {
   const write = async (op: () => Promise<Draft>): Promise<void> => {
+    const session = get().sessionId;
     set({ saving: true, saveError: null });
     try {
-      set({ draft: await op() });
+      const draft = await op();
+      if (get().sessionId === session) set({ draft });
     } catch (err) {
       set({ saveError: (err as Error).message });
     } finally {
@@ -98,7 +152,64 @@ export const useReview = create<ReviewState>((set, get) => {
     }
   };
 
+  const replaceSession = (updated: SessionSummary) =>
+    set((state) => ({
+      sessions: (state.sessions ?? [])
+        .map((s) => (s.id === updated.id ? updated : s))
+        .filter((s) => s.status !== 'closed'),
+    }));
+
   return {
+    sessions: null,
+    sessionsError: null,
+    sessionId: startingSession,
+    pickerOpen: false,
+    newSessionOpen: false,
+
+    loadSessions: async () => {
+      try {
+        set({ sessions: await api.listSessions(), sessionsError: null });
+      } catch (err) {
+        set({ sessionsError: (err as Error).message });
+      }
+    },
+
+    selectSession: (id) => {
+      api.setApiSession(id);
+      rememberSessionInUrl(id);
+      set({ ...FRESH_VIEW, sessionId: id, pickerOpen: false, status: id ? 'loading' : 'ready' });
+      if (id) void get().load();
+    },
+
+    setPickerOpen: (pickerOpen) => set({ pickerOpen }),
+    setNewSessionOpen: (newSessionOpen) => set({ newSessionOpen, pickerOpen: false }),
+
+    closeSession: async (id) => {
+      try {
+        replaceSession(await api.closeSession(id));
+        if (get().sessionId === id) get().selectSession(null);
+      } catch (err) {
+        set({ sessionsError: (err as Error).message });
+      }
+    },
+
+    renameSession: async (id, name) => {
+      try {
+        replaceSession(await api.updateSession(id, { name }));
+      } catch (err) {
+        set({ sessionsError: (err as Error).message });
+      }
+    },
+
+    setSessionBase: async (id, base) => {
+      try {
+        replaceSession(await api.updateSession(id, { base }));
+        if (get().sessionId === id) await get().load();
+      } catch (err) {
+        set({ saveError: (err as Error).message });
+      }
+    },
+
     model: null,
     draft: null,
     status: 'loading',
@@ -123,9 +234,16 @@ export const useReview = create<ReviewState>((set, get) => {
     composingPath: null,
 
     load: async () => {
+      const session = get().sessionId;
+      if (!session) {
+        set({ status: 'ready' });
+        return;
+      }
+
       set({ status: 'loading', error: null });
       try {
         const { model, draft } = await api.fetchReview();
+        if (get().sessionId !== session) return;
         const previous = get().activePath;
 
         set({
@@ -138,7 +256,11 @@ export const useReview = create<ReviewState>((set, get) => {
             : (model.files[0]?.path ?? null),
         });
       } catch (err) {
-        set({ status: 'error', error: (err as Error).message });
+        if (get().sessionId !== session) return;
+        set({
+          status: err instanceof api.GoneError ? 'gone' : 'error',
+          error: (err as Error).message,
+        });
       }
     },
 
@@ -224,7 +346,7 @@ export const useReview = create<ReviewState>((set, get) => {
       try {
         const submitResult = await api.submitReview();
         set({ submitResult, preview: null });
-        await get().load();
+        await Promise.all([get().load(), get().loadSessions()]);
       } catch (err) {
         set({ saveError: (err as Error).message });
       } finally {

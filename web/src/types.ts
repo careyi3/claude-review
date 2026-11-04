@@ -109,3 +109,37 @@ export interface ReviewPayload {
   model: ReviewModel;
   draft: Draft;
 }
+
+export type SessionStatus = 'open' | 'submitted' | 'closed';
+
+export interface SessionSummary {
+  id: string;
+  name: string;
+  path: string;
+  commonDir: string;
+  /** `auto`, or a revision. */
+  base: string;
+  includeUntracked: boolean;
+  createdBy: 'user' | 'claude';
+  status: SessionStatus;
+  createdAt: string;
+  updatedAt: string;
+  submittedAt: string | null;
+  takenAt: string | null;
+  rounds: number;
+  branch: string | null;
+  missing: boolean;
+  draftComments: number;
+}
+
+export interface Suggestion {
+  path: string;
+  source: 'claude' | 'worktree';
+  branch: string | null;
+}
+
+export interface CreatedSession {
+  session: SessionSummary;
+  reused: boolean;
+  notes: string[];
+}

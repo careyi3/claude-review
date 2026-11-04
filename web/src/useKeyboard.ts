@@ -35,7 +35,9 @@ export function useKeyboard(scrollRef: React.RefObject<HTMLDivElement | null>): 
       const store = useReview.getState();
 
       if (e.key === 'Escape') {
-        if (store.shortcutsOpen) store.toggleShortcuts();
+        if (store.newSessionOpen) store.setNewSessionOpen(false);
+        else if (store.pickerOpen) store.setPickerOpen(false);
+        else if (store.shortcutsOpen) store.toggleShortcuts();
         else if (store.preview !== null) store.closePreview();
         else if (store.composingPath) store.setComposingPath(null);
         else store.clearSelection();
@@ -49,6 +51,14 @@ export function useKeyboard(scrollRef: React.RefObject<HTMLDivElement | null>): 
       }
 
       if (isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (store.newSessionOpen) return;
+
+      if (e.key === 's') {
+        e.preventDefault();
+        if (store.sessionId) store.setPickerOpen(!store.pickerOpen);
+        return;
+      }
+      if (!store.sessionId) return;
 
       const { model, activePath } = store;
       const files = model?.files ?? [];

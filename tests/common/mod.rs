@@ -8,7 +8,10 @@ use tempfile::TempDir;
 
 pub struct Repo {
     pub dir: PathBuf,
+    /// Stands in for the session's directory in the registry.
+    pub store: PathBuf,
     _temp: TempDir,
+    _store: TempDir,
 }
 
 impl Repo {
@@ -17,7 +20,15 @@ impl Repo {
 
         let dir = fs::canonicalize(temp.path()).expect("canonical temp dir");
 
-        let repo = Self { dir, _temp: temp };
+        let store_temp = TempDir::with_prefix("claude-review-store-").expect("temp store");
+        let store = fs::canonicalize(store_temp.path()).expect("canonical store dir");
+
+        let repo = Self {
+            dir,
+            store,
+            _temp: temp,
+            _store: store_temp,
+        };
         repo.git(&["init", "-b", "main"]);
         repo
     }
@@ -68,6 +79,10 @@ impl Repo {
 
     pub fn path(&self) -> &Path {
         &self.dir
+    }
+
+    pub fn store(&self) -> &Path {
+        &self.store
     }
 
     pub fn list(&self, dir: &str) -> Vec<String> {

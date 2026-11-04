@@ -229,3 +229,51 @@ fn reports_a_missing_repository_as_an_error() {
 
     assert!(build_review(&options(outside.path())).is_err());
 }
+
+fn against(repo: &Repo, base: &str) -> ReviewModel {
+    build_review(&BuildOptions {
+        base: base.to_string(),
+        ..options(repo.path())
+    })
+    .expect("build review")
+}
+
+#[test]
+fn an_older_base_includes_work_committed_since() {
+    let repo = base_repo();
+    repo.write("src/edit.ts", lines(&["one", "TWO", "three"]));
+    repo.remove("src/gone.ts");
+    repo.write("src/new.ts", lines(&["committed"]));
+    repo.commit("branch work");
+    repo.write("src/wip.ts", lines(&["uncommitted"]));
+
+    let model = against(&repo, "HEAD~1");
+
+    assert_eq!(
+        paths(&model),
+        vec!["src/edit.ts", "src/gone.ts", "src/new.ts", "src/wip.ts"]
+    );
+    assert_eq!(by_path(&model, "src/edit.ts").status, FileStatus::Modified);
+    assert_eq!(by_path(&model, "src/gone.ts").status, FileStatus::Deleted);
+    assert_eq!(by_path(&model, "src/new.ts").status, FileStatus::Added);
+    assert_eq!(by_path(&model, "src/wip.ts").status, FileStatus::Untracked);
+
+    assert_eq!(
+        paths(&review(&repo)),
+        vec!["src/wip.ts"],
+        "HEAD still means uncommitted only"
+    );
+}
+
+#[test]
+fn an_older_base_follows_a_rename_committed_since() {
+    let repo = base_repo();
+    repo.git(&["mv", "src/move.ts", "src/moved.ts"]);
+    repo.commit("rename");
+
+    let model = against(&repo, "HEAD~1");
+    let file = by_path(&model, "src/moved.ts");
+
+    assert_eq!(file.status, FileStatus::Renamed);
+    assert_eq!(file.old_path.as_deref(), Some("src/move.ts"));
+}

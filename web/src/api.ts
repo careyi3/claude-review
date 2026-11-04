@@ -1,6 +1,34 @@
-import type { CommentTag, Draft, ReviewPayload, Side } from './types.ts';
+import type {
+  CommentTag,
+  CreatedSession,
+  Draft,
+  ReviewPayload,
+  SessionSummary,
+  Side,
+  Suggestion,
+} from './types.ts';
 
 const token = new URLSearchParams(window.location.search).get('token') ?? '';
+
+export function eventsUrl(session: string | null): string {
+  const params = new URLSearchParams({ token });
+  if (session) params.set('session', session);
+  return `/api/events?${params.toString()}`;
+}
+
+export class GoneError extends Error {}
+
+let current: string | null = null;
+
+/** Which session the session-scoped calls below talk to. */
+export function setApiSession(id: string | null): void {
+  current = id;
+}
+
+function scoped(path: string): string {
+  if (!current) throw new Error('No session is selected.');
+  return `/api/sessions/${encodeURIComponent(current)}${path}`;
+}
 
 async function send<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
   const res = await fetch(path, {
@@ -22,6 +50,7 @@ async function send<T>(path: string, method = 'GET', body?: unknown): Promise<T>
       .then((d: { error?: string }) => d.error)
       .catch(() => '');
 
+    if (res.status === 410) throw new GoneError(detail || 'This session’s worktree no longer exists.');
     throw new Error(detail || `Request to ${path} failed (${res.status}).`);
   }
 
@@ -29,7 +58,7 @@ async function send<T>(path: string, method = 'GET', body?: unknown): Promise<T>
 }
 
 export function fetchReview(): Promise<ReviewPayload> {
-  return send<ReviewPayload>('/api/review');
+  return send<ReviewPayload>(scoped('/review'));
 }
 
 export interface NewCommentInput {
@@ -42,19 +71,19 @@ export interface NewCommentInput {
 }
 
 export function createComment(input: NewCommentInput): Promise<Draft> {
-  return send<Draft>('/api/comments', 'POST', input);
+  return send<Draft>(scoped('/comments'), 'POST', input);
 }
 
 export function updateComment(id: string, patch: { tag?: CommentTag; body?: string }): Promise<Draft> {
-  return send<Draft>(`/api/comments/${encodeURIComponent(id)}`, 'PATCH', patch);
+  return send<Draft>(scoped(`/comments/${encodeURIComponent(id)}`), 'PATCH', patch);
 }
 
 export function deleteComment(id: string): Promise<Draft> {
-  return send<Draft>(`/api/comments/${encodeURIComponent(id)}`, 'DELETE');
+  return send<Draft>(scoped(`/comments/${encodeURIComponent(id)}`), 'DELETE');
 }
 
 export function putOverall(overall: string): Promise<Draft> {
-  return send<Draft>('/api/overall', 'PUT', { overall });
+  return send<Draft>(scoped('/overall'), 'PUT', { overall });
 }
 
 export interface FileContent {
@@ -64,7 +93,7 @@ export interface FileContent {
 }
 
 export function fetchFile(path: string, side: Side): Promise<FileContent> {
-  return send<FileContent>(`/api/file?path=${encodeURIComponent(path)}&side=${side}`);
+  return send<FileContent>(scoped(`/file?path=${encodeURIComponent(path)}&side=${side}`));
 }
 
 export interface SubmitResult {
@@ -76,13 +105,42 @@ export interface SubmitResult {
 }
 
 export function fetchPreview(): Promise<{ markdown: string }> {
-  return send<{ markdown: string }>('/api/preview');
+  return send<{ markdown: string }>(scoped('/preview'));
 }
 
 export function submitReview(): Promise<SubmitResult> {
-  return send<SubmitResult>('/api/submit', 'POST', {});
+  return send<SubmitResult>(scoped('/submit'), 'POST', {});
 }
 
 export function putViewed(path: string, digest: string | null): Promise<Draft> {
-  return send<Draft>('/api/viewed', 'PUT', { path, digest });
+  return send<Draft>(scoped('/viewed'), 'PUT', { path, digest });
+}
+
+export function listSessions(): Promise<SessionSummary[]> {
+  return send<SessionSummary[]>('/api/sessions');
+}
+
+export interface NewSessionInput {
+  path: string;
+  name?: string;
+  base?: string;
+}
+
+export function createSession(input: NewSessionInput): Promise<CreatedSession> {
+  return send<CreatedSession>('/api/sessions', 'POST', input);
+}
+
+export function updateSession(
+  id: string,
+  patch: { name?: string; base?: string; status?: 'open' | 'closed' },
+): Promise<SessionSummary> {
+  return send<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`, 'PATCH', patch);
+}
+
+export function closeSession(id: string): Promise<SessionSummary> {
+  return send<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`, 'DELETE');
+}
+
+export function fetchSuggestions(): Promise<Suggestion[]> {
+  return send<Suggestion[]>('/api/suggestions');
 }

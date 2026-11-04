@@ -3,6 +3,7 @@ import { useReview } from '../store.ts';
 export function SubmittedBanner() {
   const result = useReview((s) => s.submitResult);
   const dismiss = useReview((s) => s.dismissResult);
+  const sessionId = useReview((s) => s.sessionId);
 
   if (!result) return null;
 
@@ -31,7 +32,9 @@ export function SubmittedBanner() {
 
       <p>
         Now run <code className="mono font-medium">/review-feedback</code> in Claude Code to have
-        it work through your comments.
+        it work through your comments. If Claude did not start this session, pass the id:{' '}
+        <code className="mono">/review-feedback {sessionId}</code>. Once it has made changes, review
+        them here and submit another round.
       </p>
     </section>
   );

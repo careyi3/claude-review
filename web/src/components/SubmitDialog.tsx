@@ -22,8 +22,9 @@ export function SubmitDialog() {
         <header className="border-b px-4 py-3" style={{ borderColor: 'var(--border-subtle)' }}>
           <h2 className="font-medium">Submit review</h2>
           <p className="mt-1 text-[11px]" style={{ color: 'var(--text-muted)' }}>
-            Writes this to <code>.claude/review/latest.md</code> and clears the draft. The
-            timestamped JSON beside it is a full copy, so a mistaken submit can be recovered.
+            Saves this as the session’s latest review, for <code>/review-feedback</code> to pick
+            up, and clears the draft. A timestamped copy is kept beside it, so a mistaken submit can
+            be recovered.
           </p>
         </header>
 

@@ -1,18 +1,45 @@
 ---
 description: Work through the code review left by claude-review
+argument-hint: "[session id]"
+allowed-tools: Bash(claude-review sessions:*), Bash(claude-review take:*), Bash(claude-review show:*)
 ---
+<!-- claude-review:managed -->
 
-A human has reviewed your changes using `claude-review` and left comments.
-Here is their review:
+A human has reviewed your changes in `claude-review` and may have submitted
+comments. These sessions have a submitted review waiting, as JSON:
 
-!`cat .claude/review/latest.md 2>/dev/null || echo "NO_REVIEW_FOUND"`
+!`claude-review sessions --status submitted --json 2>&1 || echo "CLAUDE_REVIEW_UNAVAILABLE"`
 
-If the review above says `NO_REVIEW_FOUND`, stop and tell the user there is no
-submitted review at `.claude/review/latest.md`, and that they need to run
-`claude-review` and press Submit first. Do not guess at what they might have
-meant.
+The session id the user passed, if any: `$ARGUMENTS`
 
-Otherwise, work through it as follows.
+If the output above says `CLAUDE_REVIEW_UNAVAILABLE` or is an error, stop and
+tell the user that `claude-review` could not be run, quoting the error.
+
+**Pick the session.** Each entry has an `id`, `name`, `path`, `branch`,
+`submittedAt`, and a `relation` to your current directory: `same` (it is your
+worktree), `worktree` (another worktree of the same repository), `parent` (it
+is inside your directory), or absent.
+
+1. If the user passed a session id, use it. `take` accepts a unique prefix.
+2. Otherwise, if you registered a session earlier in this conversation (with
+   `/review-start` or `claude-review register`), use that id. If it is not in
+   the list, tell the user no review has been submitted for it yet, and stop.
+3. Otherwise, if exactly one entry has `relation` `same`, use it.
+4. Otherwise, if the list is empty, tell the user there is no submitted review
+   waiting, and that they need to open `claude-review`, review, and press
+   Submit first. Stop. Do not guess at what they might have meant.
+5. Otherwise, ask the user which one to work on with the AskUserQuestion tool.
+   Label each option with the session name, and describe it with its branch,
+   path and when it was submitted. Put sessions with a `relation` first. If
+   there are more than four, list them all in a message and ask for the id
+   instead.
+
+**Fetch the review** with `claude-review take <id>`. It prints the review and
+marks it as picked up, so it will not be offered again. If you need to see it a
+second time, use `claude-review show <id>`, which changes nothing.
+
+The review's `Repository` line is the worktree its paths are relative to. If it
+is not your current directory, work in that directory.
 
 **Handle the comments in tag order.**
 
@@ -36,7 +63,9 @@ you concluded. Comments listed under "files no longer in the diff" refer to
 work that was reverted or committed — check before assuming they still apply.
 
 **Verify your work.** Run the project's tests and type checks after making the
-changes. Report failures honestly rather than describing the work as done. Use your judgement on if the entire test suite needs to be run or just a subset or even none if the change is small enough.
+changes. Report failures honestly rather than describing the work as done. Use
+your judgement on whether the entire test suite needs to be run, just a subset,
+or none if the change is small enough.
 
 **Then report back with a disposition table** covering every comment, using the
 numbers from the review:
@@ -49,4 +78,6 @@ numbers from the review:
 
 Use `fixed`, `answered`, `declined`, or `deferred`. Every comment in the review
 gets a row, including ones you disagreed with. Follow the table with any
-detail that does not fit in it, and end by saying whether tests pass.
+detail that does not fit in it, and end by saying whether tests pass. Mention
+that the session stays open, so the user can review your changes in
+`claude-review` and submit another round.
