@@ -1,15 +1,26 @@
 [package]
-name = "claude-review"
+name = "claude-review-cli"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Local diff review tool: review Claude's changes in a browser, leave line comments, hand them back as a structured blob."
 readme = "README.md"
 license = "MIT"
+repository = "https://github.com/careyi3/claude-review"
+homepage = "https://github.com/careyi3/claude-review"
 keywords = ["claude", "code-review", "diff", "git", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
-exclude = ["/.github"]
+# web/dist is gitignored; listing it here ships the prebuilt UI, so installing
+# from crates.io needs no Node. Build it with `yarn --cwd web build` first.
+include = [
+    "/build.rs",
+    "/src/**",
+    "/commands/**",
+    "/web/dist/**",
+    "/README.md",
+    "/LICENSE",
+]
 
 [lib]
 name = "claude_review"

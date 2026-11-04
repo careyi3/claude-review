@@ -1,0 +1,10 @@
+# Spliced into dist's release workflow before each build: build.rs runs vite,
+# so the UI's dependencies must be installed first.
+- name: Install Node
+  uses: actions/setup-node@v4
+  with:
+    node-version: 22
+- name: Enable corepack
+  run: corepack enable
+- name: Install UI dependencies
+  run: yarn --cwd web install --immutable

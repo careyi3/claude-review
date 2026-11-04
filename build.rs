@@ -12,13 +12,19 @@ Rebuild without it.";
 fn watched(web: &Path) {
     for path in [
         "src",
+        "dist",
         "index.html",
         "package.json",
         "yarn.lock",
         "vite.config.ts",
         "tsconfig.json",
     ] {
-        println!("cargo:rerun-if-changed={}", web.join(path).display());
+        // Cargo reruns every build for a missing path, and a packaged crate
+        // ships only the prebuilt bundle.
+        let path = web.join(path);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
     }
     println!("cargo:rerun-if-env-changed={SKIP}");
 }
@@ -26,6 +32,19 @@ fn watched(web: &Path) {
 fn write_stub(out: &Path) {
     fs::create_dir_all(out).expect("create bundle directory");
     fs::write(out.join("index.html"), STUB).expect("write stub shell");
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create bundle directory");
+    for entry in fs::read_dir(from).expect("read prebuilt bundle") {
+        let entry = entry.expect("read prebuilt bundle");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("stat prebuilt bundle").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).expect("copy prebuilt bundle");
+        }
+    }
 }
 
 fn main() {
@@ -45,6 +64,18 @@ fn main() {
         .join("node_modules")
         .join(".bin")
         .join(if cfg!(windows) { "vite.cmd" } else { "vite" });
+
+    // A published crate has no node_modules but ships web/dist, built before
+    // packaging. A checkout with node_modules always rebuilds, so a stale dist
+    // never wins.
+    let prebuilt = web.join("dist");
+    if !vite.exists() && prebuilt.join("index.html").is_file() {
+        if out.exists() {
+            fs::remove_dir_all(&out).expect("clear bundle directory");
+        }
+        copy_dir(&prebuilt, &out);
+        return;
+    }
 
     if !vite.exists() {
         panic!(
