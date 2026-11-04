@@ -21,5 +21,11 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# release.yml is hand-edited (the tap commit author), so dist must not
+# regenerate it or fail CI over the difference
+allow-dirty = ["ci"]
+# Releases are created on GitHub, which pushes the tag that starts the
+# workflow; upload to that release rather than creating one
+create-release = false
 # Steps to run before each build: installs the UI's dependencies for build.rs
 github-build-setup = "../build-setup.yml"
