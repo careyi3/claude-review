@@ -9,6 +9,8 @@ import { SubmitDialog } from './components/SubmitDialog.tsx';
 import { SubmittedBanner } from './components/SubmittedBanner.tsx';
 import { ShortcutsOverlay } from './components/ShortcutsOverlay.tsx';
 import { StaleBanner } from './components/StaleBanner.tsx';
+import { NewSessionDialog } from './components/NewSessionDialog.tsx';
+import { SessionHome } from './components/SessionHome.tsx';
 import { useKeyboard } from './useKeyboard.ts';
 import { useLiveReload } from './useLiveReload.ts';
 
@@ -25,14 +27,18 @@ export function App() {
   const endSelection = useReview((s) => s.endSelection);
   const clearSelection = useReview((s) => s.clearSelection);
   const sidebarOpen = useReview((s) => s.sidebarOpen);
+  const sessionId = useReview((s) => s.sessionId);
+  const loadSessions = useReview((s) => s.loadSessions);
+  const selectSession = useReview((s) => s.selectSession);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useKeyboard(scrollRef);
   useLiveReload();
 
   useEffect(() => {
+    void loadSessions();
     void load();
-  }, [load]);
+  }, [load, loadSessions]);
 
   useEffect(() => {
     const onMouseUp = () => endSelection();
@@ -59,6 +65,39 @@ export function App() {
     return () => observer.disconnect();
   }, [model, setActivePath]);
 
+  if (!sessionId) {
+    return (
+      <div className="h-full overflow-y-auto">
+        <NewSessionDialog />
+        <SessionHome />
+      </div>
+    );
+  }
+
+  const backToSessions = (
+    <button
+      type="button"
+      onClick={() => selectSession(null)}
+      className="cursor-pointer rounded border px-3 py-1.5"
+      style={{ borderColor: 'var(--border)' }}
+    >
+      All sessions
+    </button>
+  );
+
+  if (status === 'gone') {
+    return (
+      <Centered>
+        <p className="mb-3 font-medium">This session’s worktree is gone</p>
+        <p className="mb-4" style={{ color: 'var(--text-muted)' }}>
+          {error} It was probably removed after the work was merged. Close the session from the
+          list, or recreate the worktree.
+        </p>
+        {backToSessions}
+      </Centered>
+    );
+  }
+
   if (status === 'error') {
     return (
       <Centered>
@@ -73,7 +112,8 @@ export function App() {
           style={{ borderColor: 'var(--border)' }}
         >
           Try again
-        </button>
+        </button>{' '}
+        {backToSessions}
       </Centered>
     );
   }
@@ -93,6 +133,7 @@ export function App() {
     <div className="flex h-full flex-col">
       <SubmitDialog />
       <ShortcutsOverlay />
+      <NewSessionDialog />
       <Header model={model} draft={draft} onReload={() => void load()} reloading={status === 'loading'} />
 
       <StaleBanner />

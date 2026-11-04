@@ -16,6 +16,9 @@ const EXCLUDED_PREFIX: &str = ".claude/review/";
 pub struct BuildOptions {
     pub cwd: PathBuf,
     pub base: String,
+    /// How to describe `base` to people, when it is a resolved SHA standing in
+    /// for something friendlier such as a merge-base.
+    pub base_label: Option<String>,
     pub include_untracked: bool,
     pub context_lines: u32,
     pub max_file_bytes: u64,
@@ -26,6 +29,7 @@ impl Default for BuildOptions {
         Self {
             cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             base: "HEAD".to_string(),
+            base_label: None,
             include_untracked: true,
             context_lines: 3,
             max_file_bytes: 1_000_000,
@@ -213,12 +217,45 @@ fn build_file(
     file
 }
 
+/// What differs from `base`. Against HEAD that is just `git status`. Against an
+/// older commit, such as a merge-base, it also includes work committed since,
+/// which `git status` cannot see.
+fn changed_entries(
+    root: &Path,
+    base: Option<&str>,
+    include_untracked: bool,
+) -> git::Result<Vec<StatusEntry>> {
+    let status = git::status(root, include_untracked)?;
+
+    let head = git::resolve_rev(root, "HEAD");
+    let Some(base) = base.filter(|sha| Some(*sha) != head.as_deref()) else {
+        return Ok(status);
+    };
+
+    let unmerged: std::collections::HashSet<&str> = status
+        .iter()
+        .filter(|e| e.unmerged)
+        .map(|e| e.path.as_str())
+        .collect();
+
+    let mut entries: Vec<StatusEntry> = git::diff_entries(root, base)?
+        .into_iter()
+        .map(|mut entry| {
+            entry.unmerged |= unmerged.contains(entry.path.as_str());
+            entry
+        })
+        .collect();
+
+    entries.extend(status.iter().filter(|e| e.untracked).cloned());
+    Ok(entries)
+}
+
 pub fn build_review(opts: &BuildOptions) -> git::Result<ReviewModel> {
     let root_string = git::repo_root(&opts.cwd)?;
     let root = Path::new(&root_string);
 
     let sha = git::resolve_rev(root, &opts.base);
-    let entries = git::status(root, opts.include_untracked)?;
+    let entries = changed_entries(root, sha.as_deref(), opts.include_untracked)?;
 
     let mut files: Vec<FileDiff> = entries
         .iter()
@@ -244,7 +281,7 @@ pub fn build_review(opts: &BuildOptions) -> git::Result<ReviewModel> {
         version: 1,
         repo_root: root_string,
         base: ReviewBase {
-            rev: opts.base.clone(),
+            rev: opts.base_label.clone().unwrap_or_else(|| opts.base.clone()),
             sha,
         },
         generated_at: now_iso(),

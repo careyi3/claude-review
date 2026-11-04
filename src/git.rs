@@ -198,3 +198,138 @@ pub fn read_blob(root: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
     let spec = format!("{rev}:{path}");
     run(root, &["cat-file", "blob", &spec]).ok()
 }
+
+fn absolute_from(root: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+
+    std::fs::canonicalize(&joined)
+        .unwrap_or(joined)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The repository's shared `.git` directory. Every worktree of one repository
+/// reports the same value, which is how sessions recognise each other's
+/// worktrees.
+pub fn common_dir(root: &Path) -> Result<String> {
+    let raw = run_text(root, &["rev-parse", "--git-common-dir"])?;
+    Ok(absolute_from(root, raw.trim()))
+}
+
+pub fn current_branch(root: &Path) -> Option<String> {
+    run_text(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The branch work is usually merged into: origin's HEAD if it is set, else a
+/// local `main` or `master`. Prefers the local branch when one exists.
+pub fn default_branch(root: &Path) -> Option<String> {
+    let from_origin = run_text(
+        root,
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .and_then(|s| s.strip_prefix("origin/").map(str::to_string));
+
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(name) = from_origin {
+        candidates.push(name.clone());
+        candidates.push(format!("origin/{name}"));
+    }
+    for name in ["main", "master", "origin/main", "origin/master"] {
+        candidates.push(name.to_string());
+    }
+
+    candidates
+        .into_iter()
+        .find(|name| resolve_rev(root, name).is_some())
+}
+
+pub fn merge_base(root: &Path, a: &str, b: &str) -> Option<String> {
+    run_text(root, &["merge-base", a, b])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Paths of every worktree attached to the repository at `root`.
+pub fn worktrees(root: &Path) -> Vec<String> {
+    let Ok(raw) = run_text(root, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+
+    raw.lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Parses `git diff --name-status -z` output into status entries.
+pub fn parse_name_status(raw: &str) -> Vec<StatusEntry> {
+    let tokens: Vec<&str> = raw.split('\0').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let code = tokens[i];
+        if code.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let kind = code.as_bytes()[0];
+        let entry = |path: &str, orig: Option<&str>, similarity: Option<u32>| StatusEntry {
+            path: path.to_string(),
+            orig_path: orig.map(str::to_string),
+            xy: code.to_string(),
+            sub: "N...".to_string(),
+            untracked: false,
+            unmerged: kind == b'U',
+            similarity,
+        };
+
+        match kind {
+            b'R' | b'C' => {
+                let (Some(old), Some(new)) = (tokens.get(i + 1), tokens.get(i + 2)) else {
+                    break;
+                };
+                if kind == b'R' {
+                    out.push(entry(new, Some(old), leading_int(&code[1..])));
+                } else {
+                    out.push(entry(new, None, None));
+                }
+                i += 3;
+            }
+            _ => {
+                let Some(path) = tokens.get(i + 1) else { break };
+                out.push(entry(path, None, None));
+                i += 2;
+            }
+        }
+    }
+
+    out
+}
+
+/// Every path that differs between `rev` and the working tree, committed or
+/// not. Untracked files are not included; `status` has those.
+pub fn diff_entries(root: &Path, rev: &str) -> Result<Vec<StatusEntry>> {
+    let raw = run_text(
+        root,
+        &["diff", "--name-status", "-z", "--find-renames", rev, "--"],
+    )?;
+    Ok(parse_name_status(&raw))
+}

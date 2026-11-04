@@ -11,14 +11,18 @@ use crate::fsutil::write_atomic;
 use crate::sides::{read_sides, side_lines};
 use crate::types::{AnchorState, Comment, CommentAnchor, CommentTag, Draft, ReviewModel, Side};
 
-pub const DRAFT_FILE: &str = ".draft.json";
+pub const DRAFT_FILE: &str = "draft.json";
 
-pub fn draft_dir(root: &Path) -> PathBuf {
-    root.join(".claude").join("review")
+/// Where versions before sessions kept their draft, inside the repository.
+pub const LEGACY_DRAFT_FILE: &str = ".draft.json";
+
+/// `dir` is the session's own directory in the registry, not the repository.
+pub fn draft_path(dir: &Path) -> PathBuf {
+    dir.join(DRAFT_FILE)
 }
 
-pub fn draft_path(root: &Path) -> PathBuf {
-    draft_dir(root).join(DRAFT_FILE)
+pub fn legacy_review_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".claude").join("review")
 }
 
 pub fn empty_draft() -> Draft {
@@ -160,8 +164,12 @@ fn normalize(draft: &Draft) -> Draft {
     }
 }
 
-pub fn load_draft(root: &Path) -> Draft {
-    let Ok(text) = fs::read_to_string(draft_path(root)) else {
+pub fn load_draft(dir: &Path) -> Draft {
+    load_draft_file(&draft_path(dir))
+}
+
+pub fn load_draft_file(path: &Path) -> Draft {
+    let Ok(text) = fs::read_to_string(path) else {
         return empty_draft();
     };
 
@@ -171,17 +179,18 @@ pub fn load_draft(root: &Path) -> Draft {
     }
 }
 
-pub fn save_draft(root: &Path, draft: &Draft) -> Draft {
+pub fn save_draft(dir: &Path, draft: &Draft) -> Draft {
     let normalized = normalize(draft);
 
     if let Ok(json) = serde_json::to_string_pretty(&normalized) {
-        let _ = write_atomic(&draft_path(root), &json);
+        let _ = write_atomic(&draft_path(dir), &json);
     }
 
     normalized
 }
 
-pub fn resolve_draft(root: &Path, model: &ReviewModel, draft: &Draft) -> Draft {
+pub fn resolve_draft(model: &ReviewModel, draft: &Draft) -> Draft {
+    let root = Path::new(&model.repo_root);
     let mut cache: HashMap<(Side, String), Vec<String>> = HashMap::new();
 
     let mut resolved = draft.clone();
@@ -225,7 +234,8 @@ pub struct NewComment {
     pub body: String,
 }
 
-pub fn add_comment(root: &Path, model: &ReviewModel, input: NewComment) -> Draft {
+pub fn add_comment(dir: &Path, model: &ReviewModel, input: NewComment) -> Draft {
+    let root = Path::new(&model.repo_root);
     let mut anchor = None;
 
     if let (Some(file), Some(side), Some(start), Some(end)) = (
@@ -256,11 +266,11 @@ pub fn add_comment(root: &Path, model: &ReviewModel, input: NewComment) -> Draft
         resolved_end_line: None,
     };
 
-    let mut draft = load_draft(root);
+    let mut draft = load_draft(dir);
     draft.comments.push(comment);
 
-    let saved = save_draft(root, &draft);
-    resolve_draft(root, model, &saved)
+    let saved = save_draft(dir, &draft);
+    resolve_draft(model, &saved)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -269,8 +279,8 @@ pub struct CommentPatch {
     pub body: Option<String>,
 }
 
-pub fn patch_comment(root: &Path, model: &ReviewModel, id: &str, patch: CommentPatch) -> Draft {
-    let mut draft = load_draft(root);
+pub fn patch_comment(dir: &Path, model: &ReviewModel, id: &str, patch: CommentPatch) -> Draft {
+    let mut draft = load_draft(dir);
 
     for comment in &mut draft.comments {
         if comment.id != id {
@@ -285,20 +295,20 @@ pub fn patch_comment(root: &Path, model: &ReviewModel, id: &str, patch: CommentP
         comment.updated_at = now_iso();
     }
 
-    let saved = save_draft(root, &draft);
-    resolve_draft(root, model, &saved)
+    let saved = save_draft(dir, &draft);
+    resolve_draft(model, &saved)
 }
 
-pub fn remove_comment(root: &Path, model: &ReviewModel, id: &str) -> Draft {
-    let mut draft = load_draft(root);
+pub fn remove_comment(dir: &Path, model: &ReviewModel, id: &str) -> Draft {
+    let mut draft = load_draft(dir);
     draft.comments.retain(|c| c.id != id);
 
-    let saved = save_draft(root, &draft);
-    resolve_draft(root, model, &saved)
+    let saved = save_draft(dir, &draft);
+    resolve_draft(model, &saved)
 }
 
-pub fn set_viewed(root: &Path, model: &ReviewModel, path: &str, digest: Option<&str>) -> Draft {
-    let mut draft = load_draft(root);
+pub fn set_viewed(dir: &Path, model: &ReviewModel, path: &str, digest: Option<&str>) -> Draft {
+    let mut draft = load_draft(dir);
 
     match digest {
         Some(digest) => {
@@ -309,14 +319,14 @@ pub fn set_viewed(root: &Path, model: &ReviewModel, path: &str, digest: Option<&
         }
     }
 
-    let saved = save_draft(root, &draft);
-    resolve_draft(root, model, &saved)
+    let saved = save_draft(dir, &draft);
+    resolve_draft(model, &saved)
 }
 
-pub fn set_overall(root: &Path, model: &ReviewModel, overall: &str) -> Draft {
-    let mut draft = load_draft(root);
+pub fn set_overall(dir: &Path, model: &ReviewModel, overall: &str) -> Draft {
+    let mut draft = load_draft(dir);
     draft.overall = overall.to_string();
 
-    let saved = save_draft(root, &draft);
-    resolve_draft(root, model, &saved)
+    let saved = save_draft(dir, &draft);
+    resolve_draft(model, &saved)
 }

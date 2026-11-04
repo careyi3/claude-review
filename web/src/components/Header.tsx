@@ -1,5 +1,35 @@
 import type { Draft, ReviewModel } from '../types.ts';
 import { useReview, type ViewMode } from '../store.ts';
+import { SessionPicker } from './SessionPicker.tsx';
+import { StatusBadge } from './SessionRow.tsx';
+
+function BaseControl({ sessionId, base }: { sessionId: string; base: string }) {
+  const setSessionBase = useReview((s) => s.setSessionBase);
+  const custom = base !== 'auto' && base !== 'HEAD';
+
+  return (
+    <select
+      value={custom ? 'custom' : base}
+      title="What to compare the working tree against"
+      onChange={(e) => {
+        const choice = e.target.value;
+        if (choice === 'other') {
+          const rev = window.prompt('Compare against which revision?', custom ? base : '')?.trim();
+          if (rev) void setSessionBase(sessionId, rev);
+          return;
+        }
+        if (choice !== 'custom') void setSessionBase(sessionId, choice);
+      }}
+      className="cursor-pointer rounded border px-1 py-0.5 text-[11px]"
+      style={{ borderColor: 'var(--border)', background: 'var(--bg-raised)', color: 'var(--text-muted)' }}
+    >
+      <option value="auto">branch changes</option>
+      <option value="HEAD">uncommitted only</option>
+      {custom && <option value="custom">{base}</option>}
+      <option value="other">other revision…</option>
+    </select>
+  );
+}
 
 interface Props {
   model: ReviewModel;
@@ -21,6 +51,10 @@ export function Header({ model, draft, onReload, reloading }: Props) {
   const wrap = useReview((s) => s.wrap);
   const toggleWrap = useReview((s) => s.toggleWrap);
   const saveError = useReview((s) => s.saveError);
+  const sessionId = useReview((s) => s.sessionId);
+  const session = useReview((s) => s.sessions?.find((x) => x.id === s.sessionId));
+  const pickerOpen = useReview((s) => s.pickerOpen);
+  const setPickerOpen = useReview((s) => s.setPickerOpen);
 
   const repoName = model.repoRoot.split('/').filter(Boolean).pop() ?? model.repoRoot;
   const shortSha = model.base.sha ? model.base.sha.slice(0, 7) : 'no commits';
@@ -45,11 +79,30 @@ export function Header({ model, draft, onReload, reloading }: Props) {
         {sidebarOpen ? '◧' : '▢'}
       </button>
 
-      <h1 className="font-semibold">{repoName}</h1>
+      <div className="relative">
+        <button
+          type="button"
+          data-session-button
+          onClick={() => setPickerOpen(!pickerOpen)}
+          aria-expanded={pickerOpen}
+          title={`${model.repoRoot}\nSwitch session (s)`}
+          className="flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-0.5 hover:bg-[var(--bg-sunken)]"
+        >
+          <h1 className="font-semibold">{session?.name ?? repoName}</h1>
+          <span className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+            ▾
+          </span>
+        </button>
+        <SessionPicker />
+      </div>
 
-      <span className="mono text-[11px]" style={{ color: 'var(--text-muted)' }}>
-        working tree vs {model.base.rev} ({shortSha})
+      {session && <StatusBadge session={session} />}
+
+      <span className="mono text-[11px]" style={{ color: 'var(--text-muted)' }} title={model.repoRoot}>
+        {session?.branch ? `${session.branch} · ` : ''}vs {model.base.rev} ({shortSha})
       </span>
+
+      {sessionId && session && <BaseControl sessionId={sessionId} base={session.base} />}
 
       {saveError ? (
         <span className="text-[11px] text-rose-600 dark:text-rose-400" title={saveError}>

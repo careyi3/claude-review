@@ -1,6 +1,7 @@
 import { useReview } from '../store.ts';
 
 const SHORTCUTS: [string, string][] = [
+  ['s', 'Switch session'],
   ['j / k', 'Next / previous hunk'],
   ['n / p', 'Next / previous file'],
   ['c', 'Comment on the current file'],

@@ -52,3 +52,28 @@ export const STATE_NOTE: Record<AnchorState, string | null> = {
   moved: 'the file changed; this comment followed its line',
   orphaned: 'the line this was written against is gone',
 };
+
+export function timeAgo(iso: string | null, now = Date.now()): string {
+  if (!iso) return '';
+  const seconds = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  if (Number.isNaN(seconds)) return '';
+  if (seconds < 45) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+/** Shortens a home-directory path to `~/…` when the home directory is known. */
+export function tidyPath(path: string): string {
+  const home = /^(\/Users\/[^/]+|\/home\/[^/]+)/.exec(path)?.[1];
+  return home ? `~${path.slice(home.length)}` : path;
+}
+
+export function describeBase(base: string): string {
+  if (base === 'auto') return 'branch changes';
+  if (base === 'HEAD') return 'uncommitted changes';
+  return base;
+}

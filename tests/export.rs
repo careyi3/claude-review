@@ -87,13 +87,13 @@ impl Fixture {
     }
 
     fn render(&self, draft: Draft) -> String {
-        let resolved = resolve_draft(self.repo.path(), &self.model, &draft);
-        render_markdown(self.repo.path(), &self.model, &resolved)
+        let resolved = resolve_draft(&self.model, &draft);
+        render_markdown(&self.model, &resolved)
     }
 
     fn submit(&self) -> SubmitResult {
-        let draft = resolve_draft(self.repo.path(), &self.model, &load_draft(self.repo.path()));
-        submit_review(self.repo.path(), &self.model, &draft).expect("submit")
+        let draft = resolve_draft(&self.model, &load_draft(self.repo.store()));
+        submit_review(self.repo.store(), &self.model, &draft).expect("submit")
     }
 }
 
@@ -313,10 +313,19 @@ fn names_every_tag_it_can_emit() {
     }
 }
 
+fn reviews_dir(fixture: &Fixture) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(fixture.repo.store().join("reviews"))
+        .expect("read reviews dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 fn submitting_fixture() -> Fixture {
     let fixture = Fixture::new();
     save_draft(
-        fixture.repo.path(),
+        fixture.repo.store(),
         &draft_of(vec![comment()], "overall thoughts"),
     );
     fixture
@@ -327,7 +336,7 @@ fn writes_a_timestamped_pair_and_the_latest_pair() {
     let fixture = submitting_fixture();
     let result = fixture.submit();
 
-    let files = fixture.repo.list(".claude/review");
+    let files = reviews_dir(&fixture);
 
     assert!(files.iter().any(|f| f == "latest.md"));
     assert!(files.iter().any(|f| f == "latest.json"));
@@ -338,6 +347,7 @@ fn writes_a_timestamped_pair_and_the_latest_pair() {
         .iter()
         .any(|f| f.starts_with("review-") && f.ends_with(".json")));
     assert!(std::path::Path::new(&result.latest_markdown_path).exists());
+    assert!(!fixture.repo.path().join(".claude").exists());
 }
 
 #[test]
@@ -345,11 +355,7 @@ fn leaves_no_temp_files_behind() {
     let fixture = submitting_fixture();
     fixture.submit();
 
-    assert!(!fixture
-        .repo
-        .list(".claude/review")
-        .iter()
-        .any(|f| f.ends_with(".tmp")));
+    assert!(!reviews_dir(&fixture).iter().any(|f| f.ends_with(".tmp")));
 }
 
 #[test]
@@ -368,7 +374,7 @@ fn clears_the_draft_so_the_next_review_starts_empty() {
     let fixture = submitting_fixture();
     fixture.submit();
 
-    let after = load_draft(fixture.repo.path());
+    let after = load_draft(fixture.repo.store());
 
     assert!(after.comments.is_empty());
     assert_eq!(after.overall, "");

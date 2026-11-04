@@ -3,7 +3,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
-use claude_review::review::BuildOptions;
+use claude_review::registry::{NewSession, Registry};
 use claude_review::server::{start_server, RunningServer, ServerOptions};
 use claude_review::statics::WebSource;
 use common::{lines, Repo};
@@ -14,10 +14,18 @@ use tempfile::TempDir;
 
 struct Harness {
     repo: Repo,
+    registry: Registry,
+    session: String,
     server: RunningServer,
     client: Client,
     _web: TempDir,
+    _home: TempDir,
 }
+
+/// Routes that belong to one session, under `/api/sessions/<id>/`.
+const SESSION_ROUTES: [&str; 7] = [
+    "review", "file", "comments", "viewed", "overall", "preview", "submit",
+];
 
 impl Harness {
     async fn new() -> Self {
@@ -34,27 +42,49 @@ impl Harness {
         .expect("write shell");
         std::fs::write(web.path().join("app.js"), "console.log(1)").expect("write asset");
 
+        let home = TempDir::with_prefix("claude-review-registry-").expect("temp registry");
+        let registry = Registry::new(home.path());
+        let session = registry
+            .register(NewSession {
+                path: repo.path().to_path_buf(),
+                base: Some("HEAD".into()),
+                ..NewSession::default()
+            })
+            .expect("register session")
+            .session
+            .id;
+
         let server = start_server(ServerOptions {
-            build: BuildOptions {
-                cwd: repo.path().to_path_buf(),
-                ..BuildOptions::default()
-            },
+            registry: registry.clone(),
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             web: WebSource::Directory(web.path().to_path_buf()),
+            claude_projects: None,
         })
         .await
         .expect("start server");
 
         Self {
             repo,
+            registry,
+            session,
             server,
             client: Client::new(),
             _web: web,
+            _home: home,
         }
     }
 
+    /// Rewrites `/api/review` and friends to this harness's session.
     fn url(&self, path: &str) -> String {
+        let scoped = path.strip_prefix("/api/").and_then(|rest| {
+            let first = rest.split(['/', '?']).next().unwrap_or("");
+            SESSION_ROUTES
+                .contains(&first)
+                .then(|| format!("/api/sessions/{}/{rest}", self.session))
+        });
+
+        let path = scoped.unwrap_or_else(|| path.to_string());
         format!("http://127.0.0.1:{}{path}", self.server.port)
     }
 
@@ -725,7 +755,10 @@ async fn announces_working_tree_changes_over_sse() {
 
     let res = h
         .client
-        .get(h.url(&format!("/api/events?token={}", h.server.token)))
+        .get(h.url(&format!(
+            "/api/events?token={}&session={}",
+            h.server.token, h.session
+        )))
         .send()
         .await
         .expect("send");
@@ -760,6 +793,269 @@ async fn announces_working_tree_changes_over_sse() {
     .await;
 
     assert!(saw_change, "no change event arrived");
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn reports_health() {
+    let h = Harness::new().await;
+    let health = h.get_json("/api/health").await;
+
+    assert_eq!(health["ok"], true);
+    assert_eq!(health["pid"], std::process::id());
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn lists_sessions() {
+    let h = Harness::new().await;
+    let sessions = h.get_json("/api/sessions").await;
+
+    let list = sessions.as_array().expect("array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], h.session.as_str());
+    assert_eq!(list[0]["branch"], "main");
+    assert_eq!(list[0]["missing"], false);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn creates_a_session_for_another_repository() {
+    let h = Harness::new().await;
+    let other = Repo::new();
+    other.write("x.txt", "x\n");
+    other.commit("base");
+
+    let res = h
+        .send(
+            reqwest::Method::POST,
+            "/api/sessions",
+            json!({ "path": other.path(), "name": "other one" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let created: Value = res.json().await.expect("json");
+
+    assert_eq!(created["reused"], false);
+    assert_eq!(created["session"]["name"], "other one");
+    assert_eq!(created["session"]["createdBy"], "user");
+    assert_eq!(
+        h.get_json("/api/sessions").await.as_array().unwrap().len(),
+        2
+    );
+
+    let again = h
+        .send(
+            reqwest::Method::POST,
+            "/api/sessions",
+            json!({ "path": other.path() }),
+        )
+        .await;
+    assert_eq!(again.json::<Value>().await.unwrap()["reused"], true);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn refuses_to_create_a_session_for_a_missing_directory() {
+    let h = Harness::new().await;
+
+    let res = h
+        .send(
+            reqwest::Method::POST,
+            "/api/sessions",
+            json!({ "path": "/definitely/not/here" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn answers_404_for_an_unknown_session() {
+    let h = Harness::new().await;
+
+    let res = h.get("/api/sessions/nope1234/review").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn renames_a_session_and_refuses_to_mark_it_submitted() {
+    let h = Harness::new().await;
+    let path = format!("/api/sessions/{}", h.session);
+
+    let renamed: Value = h
+        .send(
+            reqwest::Method::PATCH,
+            &path,
+            json!({ "name": "fresh name" }),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(renamed["name"], "fresh name");
+
+    let res = h
+        .send(
+            reqwest::Method::PATCH,
+            &path,
+            json!({ "status": "submitted" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn closing_a_session_hides_it_from_the_list() {
+    let h = Harness::new().await;
+
+    let res = h
+        .send(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}", h.session),
+            json!({}),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    assert!(h
+        .get_json("/api/sessions")
+        .await
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        h.get_json("/api/sessions?all=1")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn submitting_marks_the_session_submitted_for_claude() {
+    let h = Harness::new().await;
+    h.add_comment(json!({})).await;
+
+    h.send(reqwest::Method::POST, "/api/submit", json!({}))
+        .await;
+
+    let session = h.registry.get(&h.session).expect("session");
+    assert_eq!(
+        session.status,
+        claude_review::registry::SessionStatus::Submitted
+    );
+    assert_eq!(session.rounds, 1);
+
+    let (_, markdown) = h.registry.take(&h.session).expect("take");
+    assert!(markdown.contains("why shout?"));
+    assert!(
+        !h.repo.path().join(".claude").exists(),
+        "nothing written into the repo"
+    );
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn answers_410_once_the_worktree_is_gone() {
+    let h = Harness::new().await;
+    let doomed = Repo::new();
+    doomed.write("x.txt", "x\n");
+    doomed.commit("base");
+
+    let id = h
+        .registry
+        .register(NewSession {
+            path: doomed.path().to_path_buf(),
+            ..NewSession::default()
+        })
+        .expect("register")
+        .session
+        .id;
+    std::fs::remove_dir_all(doomed.path()).expect("remove worktree");
+
+    let res = h.get(&format!("/api/sessions/{id}/review")).await;
+    assert_eq!(res.status(), StatusCode::GONE);
+
+    h.close().await;
+}
+
+#[tokio::test]
+async fn suggests_worktrees_of_known_repositories() {
+    let h = Harness::new().await;
+    let trees = TempDir::with_prefix("claude-review-trees-").expect("temp dir");
+    let feature = trees.path().join("feature");
+    h.repo.git(&[
+        "worktree",
+        "add",
+        "-b",
+        "feature",
+        &feature.to_string_lossy(),
+    ]);
+
+    let suggestions = h.get_json("/api/suggestions").await;
+    let list = suggestions.as_array().expect("array");
+    let canonical = std::fs::canonicalize(&feature).unwrap();
+
+    assert_eq!(list.len(), 1, "the session's own worktree is not suggested");
+    assert_eq!(list[0]["path"], canonical.to_string_lossy().as_ref());
+    assert_eq!(list[0]["source"], "worktree");
+    assert_eq!(list[0]["branch"], "feature");
+
+    h.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn announces_registry_changes_over_sse() {
+    let h = Harness::new().await;
+
+    let res = h
+        .client
+        .get(h.url(&format!("/api/events?token={}", h.server.token)))
+        .send()
+        .await
+        .expect("send");
+    let mut stream = res.bytes_stream();
+    let mut buffered = String::new();
+
+    assert!(
+        read_until(
+            &mut stream,
+            &mut buffered,
+            "event: ready",
+            Duration::from_secs(3)
+        )
+        .await
+    );
+
+    h.registry
+        .mark_submitted(&h.session)
+        .expect("touch registry");
+
+    assert!(
+        read_until(
+            &mut stream,
+            &mut buffered,
+            "event: sessions",
+            Duration::from_secs(8)
+        )
+        .await,
+        "no sessions event arrived"
+    );
 
     h.close().await;
 }

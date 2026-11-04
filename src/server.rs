@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -16,7 +17,7 @@ use rand::RngCore;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::clock::now_iso;
@@ -26,25 +27,33 @@ use crate::drafts::{
 };
 use crate::export::{render_markdown, submit_review};
 use crate::git;
-use crate::review::{build_review, BuildOptions};
+use crate::registry::{
+    self, Creator, NewSession, Registry, Session, SessionPatch, SessionStatus, SessionSummary,
+};
+use crate::review::build_review;
 use crate::statics::{read_static_fs, WebSource};
+use crate::suggest::{claude_projects_dir, suggestions, Suggestion};
 use crate::types::{CommentTag, ReviewModel, ReviewPayload, Side};
 use crate::watch::{watch_repo, RepoWatcher, DEFAULT_DEBOUNCE};
 
 pub struct ServerOptions {
-    pub build: BuildOptions,
+    pub registry: Registry,
     pub host: IpAddr,
     pub port: u16,
     pub web: WebSource,
+    /// Where to look for recent Claude Code projects. `None` turns that kind
+    /// of suggestion off.
+    pub claude_projects: Option<PathBuf>,
 }
 
-impl Default for ServerOptions {
-    fn default() -> Self {
+impl ServerOptions {
+    pub fn new(registry: Registry) -> Self {
         Self {
-            build: BuildOptions::default(),
+            registry,
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 0,
             web: WebSource::Embedded,
+            claude_projects: claude_projects_dir(),
         }
     }
 }
@@ -73,19 +82,59 @@ impl RunningServer {
 }
 
 struct AppState {
-    build: BuildOptions,
+    registry: Registry,
     token: String,
     web: WebSource,
-    watcher: Arc<RepoWatcher>,
+    claude_projects: Option<PathBuf>,
+    /// One per session the UI has subscribed to, created on first use.
+    watchers: Mutex<HashMap<String, Arc<RepoWatcher>>>,
+    /// Ticks when anything in the registry changes, including from the CLI.
+    registry_watcher: RepoWatcher,
 }
 
 type Shared = Arc<AppState>;
 
+/// What a session-scoped handler works with.
+struct Context {
+    session: Session,
+    model: ReviewModel,
+    /// The session's directory in the registry, where its draft lives.
+    dir: PathBuf,
+}
+
 impl AppState {
-    fn context(&self) -> Result<(ReviewModel, PathBuf), ApiError> {
-        let model = build_review(&self.build)?;
-        let root = PathBuf::from(&model.repo_root);
-        Ok((model, root))
+    fn session(&self, id: &str) -> Result<Session, ApiError> {
+        self.registry
+            .get(id)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("no session `{id}`")))
+    }
+
+    fn context(&self, id: &str) -> Result<Context, ApiError> {
+        let session = self.session(id)?;
+
+        if !Path::new(&session.path).is_dir() {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                format!("{} no longer exists", session.path),
+            ));
+        }
+
+        let model = build_review(&session.build_options())?;
+        let dir = self.registry.session_dir(&session.id);
+
+        Ok(Context {
+            session,
+            model,
+            dir,
+        })
+    }
+
+    fn watcher(&self, session: &Session) -> Arc<RepoWatcher> {
+        let mut watchers = self.watchers.lock().expect("watchers lock");
+        watchers
+            .entry(session.id.clone())
+            .or_insert_with(|| Arc::new(watch_repo(Path::new(&session.path), DEFAULT_DEBOUNCE)))
+            .clone()
     }
 }
 
@@ -110,6 +159,18 @@ impl ApiError {
 impl From<git::GitError> for ApiError {
     fn from(err: git::GitError) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, format!("git: {err}"))
+    }
+}
+
+impl From<registry::Error> for ApiError {
+    fn from(err: registry::Error) -> Self {
+        let status = match err {
+            registry::Error::NotFound(_) => StatusCode::NOT_FOUND,
+            registry::Error::Ambiguous(..) | registry::Error::Invalid(_) => StatusCode::BAD_REQUEST,
+            registry::Error::Git(_) => StatusCode::BAD_REQUEST,
+            registry::Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, err.to_string())
     }
 }
 
@@ -208,10 +269,13 @@ fn side_field(body: &Value, key: &str) -> Option<Side> {
     }
 }
 
-async fn get_review(State(state): State<Shared>) -> ApiResult<ReviewPayload> {
+async fn get_review(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<ReviewPayload> {
     blocking(move || {
-        let (model, root) = state.context()?;
-        let draft = resolve_draft(&root, &model, &load_draft(&root));
+        let Context { model, dir, .. } = state.context(&id)?;
+        let draft = resolve_draft(&model, &load_draft(&dir));
 
         Ok(Json(ReviewPayload { model, draft }))
     })
@@ -227,6 +291,7 @@ struct FileContent {
 
 async fn get_file(
     State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> ApiResult<FileContent> {
     let path = params.get("path").cloned().unwrap_or_default();
@@ -240,11 +305,13 @@ async fn get_file(
     };
 
     blocking(move || {
-        let root_string = git::repo_root(&state.build.cwd)?;
+        let session = state.session(&id)?;
+        let build = session.build_options();
+        let root_string = git::repo_root(&build.cwd)?;
         let root = Path::new(&root_string);
 
         let content = match side {
-            Side::Old => git::resolve_rev(root, &state.build.base)
+            Side::Old => git::resolve_rev(root, &build.base)
                 .and_then(|rev| git::read_blob(root, &rev, &path))
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             Side::New => read_static_fs(root, &path)
@@ -265,6 +332,7 @@ async fn get_file(
 
 async fn create_comment(
     State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
     body: Bytes,
 ) -> ApiResult<crate::types::Draft> {
     let body = parse_json(&body)?;
@@ -285,15 +353,15 @@ async fn create_comment(
     };
 
     blocking(move || {
-        let (model, root) = state.context()?;
-        Ok(Json(add_comment(&root, &model, input)))
+        let ctx = state.context(&id)?;
+        Ok(Json(add_comment(&ctx.dir, &ctx.model, input)))
     })
     .await
 }
 
 async fn update_comment(
     State(state): State<Shared>,
-    UrlPath(id): UrlPath<String>,
+    UrlPath((id, comment_id)): UrlPath<(String, String)>,
     body: Bytes,
 ) -> ApiResult<crate::types::Draft> {
     let body = parse_json(&body)?;
@@ -314,24 +382,33 @@ async fn update_comment(
     }
 
     blocking(move || {
-        let (model, root) = state.context()?;
-        Ok(Json(patch_comment(&root, &model, &id, patch)))
+        let ctx = state.context(&id)?;
+        Ok(Json(patch_comment(
+            &ctx.dir,
+            &ctx.model,
+            &comment_id,
+            patch,
+        )))
     })
     .await
 }
 
 async fn delete_comment(
     State(state): State<Shared>,
-    UrlPath(id): UrlPath<String>,
+    UrlPath((id, comment_id)): UrlPath<(String, String)>,
 ) -> ApiResult<crate::types::Draft> {
     blocking(move || {
-        let (model, root) = state.context()?;
-        Ok(Json(remove_comment(&root, &model, &id)))
+        let ctx = state.context(&id)?;
+        Ok(Json(remove_comment(&ctx.dir, &ctx.model, &comment_id)))
     })
     .await
 }
 
-async fn put_viewed(State(state): State<Shared>, body: Bytes) -> ApiResult<crate::types::Draft> {
+async fn put_viewed(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> ApiResult<crate::types::Draft> {
     let body = parse_json(&body)?;
 
     let Some(path) = string_field(&body, "path") else {
@@ -340,19 +417,28 @@ async fn put_viewed(State(state): State<Shared>, body: Bytes) -> ApiResult<crate
     let digest = string_field(&body, "digest");
 
     blocking(move || {
-        let (model, root) = state.context()?;
-        Ok(Json(set_viewed(&root, &model, &path, digest.as_deref())))
+        let ctx = state.context(&id)?;
+        Ok(Json(set_viewed(
+            &ctx.dir,
+            &ctx.model,
+            &path,
+            digest.as_deref(),
+        )))
     })
     .await
 }
 
-async fn put_overall(State(state): State<Shared>, body: Bytes) -> ApiResult<crate::types::Draft> {
+async fn put_overall(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> ApiResult<crate::types::Draft> {
     let body = parse_json(&body)?;
     let overall = string_field(&body, "overall").unwrap_or_default();
 
     blocking(move || {
-        let (model, root) = state.context()?;
-        Ok(Json(set_overall(&root, &model, &overall)))
+        let ctx = state.context(&id)?;
+        Ok(Json(set_overall(&ctx.dir, &ctx.model, &overall)))
     })
     .await
 }
@@ -362,57 +448,252 @@ struct Preview {
     markdown: String,
 }
 
-async fn get_preview(State(state): State<Shared>) -> ApiResult<Preview> {
+async fn get_preview(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<Preview> {
     blocking(move || {
-        let (model, root) = state.context()?;
-        let draft = resolve_draft(&root, &model, &load_draft(&root));
+        let ctx = state.context(&id)?;
+        let draft = resolve_draft(&ctx.model, &load_draft(&ctx.dir));
 
         Ok(Json(Preview {
-            markdown: render_markdown(&root, &model, &draft),
+            markdown: render_markdown(&ctx.model, &draft),
         }))
     })
     .await
 }
 
-async fn post_submit(State(state): State<Shared>) -> ApiResult<crate::export::SubmitResult> {
+async fn post_submit(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<crate::export::SubmitResult> {
     blocking(move || {
-        let (model, root) = state.context()?;
-        let draft = resolve_draft(&root, &model, &load_draft(&root));
+        let ctx = state.context(&id)?;
+        let draft = resolve_draft(&ctx.model, &load_draft(&ctx.dir));
 
         if draft.comments.is_empty() && draft.overall.trim().is_empty() {
             return Err(ApiError::bad_request("nothing to submit"));
         }
 
-        Ok(Json(submit_review(&root, &model, &draft)?))
+        let result = submit_review(&ctx.dir, &ctx.model, &draft)?;
+        state.registry.mark_submitted(&ctx.session.id)?;
+
+        Ok(Json(result))
     })
     .await
 }
 
+fn tick_event(name: &'static str) -> Event {
+    Event::default().event(name).data(now_iso())
+}
+
+/// Waits for the next registry or working-tree change.
+async fn next_change(
+    sessions: &mut watch::Receiver<u64>,
+    tree: &mut Option<watch::Receiver<u64>>,
+) -> Option<Event> {
+    match tree {
+        Some(tree) => tokio::select! {
+            changed = sessions.changed() => changed.ok().map(|()| tick_event("sessions")),
+            changed = tree.changed() => changed.ok().map(|()| tick_event("changed")),
+        },
+        None => sessions
+            .changed()
+            .await
+            .ok()
+            .map(|()| tick_event("sessions")),
+    }
+}
+
+/// `sessions` whenever the registry changes; with `?session=<id>`, also
+/// `changed` whenever that session's working tree does.
 async fn get_events(
     State(state): State<Shared>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let receiver = state.watcher.subscribe();
-    let active = state.watcher.active();
+    let sessions = state.registry_watcher.subscribe();
+
+    let watcher = params
+        .get("session")
+        .and_then(|id| state.registry.get(id))
+        .filter(|session| Path::new(&session.path).is_dir())
+        .map(|session| state.watcher(&session));
+
+    let active = watcher.as_ref().is_some_and(|w| w.active());
+    let tree = watcher.map(|w| w.subscribe());
 
     let stream = futures::stream::unfold(
-        (Some(active), receiver),
-        |(pending_ready, mut receiver)| async move {
+        (Some(active), sessions, tree),
+        |(pending_ready, mut sessions, mut tree)| async move {
             if let Some(active) = pending_ready {
                 let event = Event::default().event("ready").data(active.to_string());
-                return Some((Ok(event), (None, receiver)));
+                return Some((Ok(event), (None, sessions, tree)));
             }
 
-            match receiver.changed().await {
-                Ok(()) => {
-                    let event = Event::default().event("changed").data(now_iso());
-                    Some((Ok(event), (None, receiver)))
-                }
-                Err(_) => None,
-            }
+            let event = next_change(&mut sessions, &mut tree).await?;
+            Some((Ok(event), (None, sessions, tree)))
         },
     );
 
     Sse::new(stream)
+}
+
+#[derive(Serialize)]
+struct Health {
+    ok: bool,
+    pid: u32,
+    version: &'static str,
+}
+
+async fn get_health() -> Json<Health> {
+    Json(Health {
+        ok: true,
+        pid: std::process::id(),
+        version: env!("CARGO_PKG_VERSION"),
+    })
+}
+
+async fn list_sessions(
+    State(state): State<Shared>,
+    Query(params): Query<HashMap<String, String>>,
+) -> ApiResult<Vec<SessionSummary>> {
+    let all = params.get("all").is_some_and(|v| v == "1" || v == "true");
+
+    blocking(move || {
+        let summaries = state
+            .registry
+            .list()
+            .into_iter()
+            .filter(|s| all || s.status != SessionStatus::Closed)
+            .map(|s| state.registry.summarize(s, None))
+            .collect();
+        Ok(Json(summaries))
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Created {
+    session: SessionSummary,
+    reused: bool,
+    notes: Vec<String>,
+}
+
+async fn create_session(State(state): State<Shared>, body: Bytes) -> ApiResult<Created> {
+    let body = parse_json(&body)?;
+
+    let Some(path) = string_field(&body, "path").filter(|p| !p.trim().is_empty()) else {
+        return Err(ApiError::bad_request("path is required"));
+    };
+
+    let input = NewSession {
+        path: expand_home(path.trim()),
+        name: string_field(&body, "name"),
+        base: string_field(&body, "base"),
+        include_untracked: body.get("includeUntracked").and_then(Value::as_bool),
+        created_by: Some(Creator::User),
+    };
+
+    blocking(move || {
+        if !input.path.is_dir() {
+            return Err(ApiError::bad_request(format!(
+                "{} is not a directory",
+                input.path.display()
+            )));
+        }
+
+        let registered = state.registry.register(input)?;
+        Ok(Json(Created {
+            session: state.registry.summarize(registered.session, None),
+            reused: registered.reused,
+            notes: registered.notes,
+        }))
+    })
+    .await
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path
+        .strip_prefix("~/")
+        .or(if path == "~" { Some("") } else { None })
+    {
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+async fn get_session(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<SessionSummary> {
+    blocking(move || {
+        let session = state.session(&id)?;
+        Ok(Json(state.registry.summarize(session, None)))
+    })
+    .await
+}
+
+async fn patch_session(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+    body: Bytes,
+) -> ApiResult<SessionSummary> {
+    let body = parse_json(&body)?;
+
+    let status = match body.get("status").and_then(Value::as_str) {
+        None => None,
+        // Submitted is only reached by submitting.
+        Some(raw) => match SessionStatus::parse(raw) {
+            Some(SessionStatus::Submitted) | None => {
+                return Err(ApiError::bad_request("status must be open or closed"))
+            }
+            other => other,
+        },
+    };
+
+    let patch = SessionPatch {
+        name: string_field(&body, "name"),
+        base: string_field(&body, "base"),
+        include_untracked: body.get("includeUntracked").and_then(Value::as_bool),
+        status,
+    };
+
+    blocking(move || {
+        let session = state.session(&id)?;
+        let updated = state.registry.update(&session.id, patch)?;
+        Ok(Json(state.registry.summarize(updated, None)))
+    })
+    .await
+}
+
+async fn delete_session(
+    State(state): State<Shared>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<SessionSummary> {
+    blocking(move || {
+        let session = state.session(&id)?;
+        let closed = state.registry.close(&session.id)?;
+        state
+            .watchers
+            .lock()
+            .expect("watchers lock")
+            .remove(&closed.id);
+        Ok(Json(state.registry.summarize(closed, None)))
+    })
+    .await
+}
+
+async fn get_suggestions(State(state): State<Shared>) -> ApiResult<Vec<Suggestion>> {
+    blocking(move || {
+        Ok(Json(suggestions(
+            &state.registry,
+            state.claude_projects.as_deref(),
+        )))
+    })
+    .await
 }
 
 fn bundle_headers(content_type: &'static str) -> [(header::HeaderName, &'static str); 2] {
@@ -445,19 +726,29 @@ async fn spa(State(state): State<Shared>, uri: Uri) -> Response {
 }
 
 fn router(state: Shared) -> Router {
-    let api = Router::new()
+    let session = Router::new()
+        .route(
+            "/",
+            get(get_session).patch(patch_session).delete(delete_session),
+        )
         .route("/review", get(get_review))
         .route("/file", get(get_file))
         .route("/comments", post(create_comment))
         .route(
-            "/comments/{id}",
+            "/comments/{comment}",
             axum::routing::patch(update_comment).delete(delete_comment),
         )
         .route("/viewed", put(put_viewed))
         .route("/overall", put(put_overall))
-        .route("/events", get(get_events))
         .route("/preview", get(get_preview))
-        .route("/submit", post(post_submit))
+        .route("/submit", post(post_submit));
+
+    let api = Router::new()
+        .route("/health", get(get_health))
+        .route("/sessions", get(list_sessions).post(create_session))
+        .route("/suggestions", get(get_suggestions))
+        .route("/events", get(get_events))
+        .nest("/sessions/{id}", session)
         .layer(middleware::from_fn_with_state(state.clone(), require_token));
 
     Router::new()
@@ -475,14 +766,17 @@ fn session_token() -> String {
 pub async fn start_server(opts: ServerOptions) -> anyhow::Result<RunningServer> {
     let token = session_token();
 
-    let model = build_review(&opts.build)?;
-    let watcher = Arc::new(watch_repo(Path::new(&model.repo_root), DEFAULT_DEBOUNCE));
+    let sessions_dir = opts.registry.sessions_dir();
+    std::fs::create_dir_all(&sessions_dir)?;
+    let registry_watcher = watch_repo(&sessions_dir, DEFAULT_DEBOUNCE);
 
     let state = Arc::new(AppState {
-        build: opts.build,
+        registry: opts.registry,
         token: token.clone(),
         web: opts.web,
-        watcher,
+        claude_projects: opts.claude_projects,
+        watchers: Mutex::new(HashMap::new()),
+        registry_watcher,
     });
 
     let listener = TcpListener::bind(SocketAddr::new(opts.host, opts.port)).await?;

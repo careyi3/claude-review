@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 
 use claude_review::anchor::create_anchor;
 use claude_review::drafts::{
-    draft_dir, draft_path, empty_draft, load_draft, normalize_draft, resolve_draft, save_draft,
-    set_viewed,
+    draft_path, empty_draft, load_draft, normalize_draft, resolve_draft, save_draft, set_viewed,
 };
 use claude_review::review::{build_review, BuildOptions};
 use claude_review::types::{AnchorState, Comment, CommentTag, Draft, ReviewModel, Side};
@@ -148,7 +147,7 @@ fn empty_draft_is_a_valid_draft() {
 #[test]
 fn returns_an_empty_draft_when_none_has_been_saved() {
     let repo = committed_repo();
-    let draft = load_draft(repo.path());
+    let draft = load_draft(repo.store());
 
     assert!(draft.comments.is_empty());
     assert_eq!(draft.overall, "");
@@ -157,9 +156,9 @@ fn returns_an_empty_draft_when_none_has_been_saved() {
 #[test]
 fn round_trips_a_saved_draft() {
     let repo = committed_repo();
-    save_draft(repo.path(), &draft_with(vec![comment()], "overall note"));
+    save_draft(repo.store(), &draft_with(vec![comment()], "overall note"));
 
-    let loaded = load_draft(repo.path());
+    let loaded = load_draft(repo.store());
 
     assert_eq!(loaded.overall, "overall note");
     assert_eq!(loaded.comments[0].id, "c1");
@@ -168,35 +167,40 @@ fn round_trips_a_saved_draft() {
 }
 
 #[test]
-fn writes_into_claude_review_and_leaves_no_temp_files_behind() {
+fn writes_into_the_session_directory_and_leaves_no_temp_files_behind() {
     let repo = committed_repo();
-    save_draft(repo.path(), &draft_with(vec![comment()], ""));
+    save_draft(repo.store(), &draft_with(vec![comment()], ""));
 
-    assert!(draft_path(repo.path()).exists());
-    assert_eq!(repo.list(".claude/review"), vec![".draft.json"]);
+    assert!(draft_path(repo.store()).exists());
+    let names: Vec<String> = std::fs::read_dir(repo.store())
+        .expect("read store")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["draft.json"]);
+    assert!(review(&repo).files.is_empty());
 }
 
 #[test]
 fn survives_a_corrupt_draft_file() {
     let repo = committed_repo();
-    save_draft(repo.path(), &draft_with(vec![comment()], ""));
-    repo.write(".claude/review/.draft.json", "{ not json");
+    save_draft(repo.store(), &draft_with(vec![comment()], ""));
+    std::fs::write(draft_path(repo.store()), "{ not json").expect("corrupt draft");
 
-    assert!(load_draft(repo.path()).comments.is_empty());
+    assert!(load_draft(repo.store()).comments.is_empty());
 }
 
 #[test]
-fn keeps_its_own_draft_directory_out_of_the_review() {
+fn keeps_a_legacy_in_repo_review_directory_out_of_the_review() {
     let repo = committed_repo();
-    save_draft(repo.path(), &draft_with(vec![comment()], ""));
+    repo.write(".claude/review/.draft.json", "{}");
+    repo.write(".claude/review/latest.md", "# old");
 
     assert!(review(&repo).files.is_empty());
-    assert!(draft_dir(repo.path()).ends_with("review"));
 }
 
 fn resolved_state(repo: &Repo, comments: Vec<Comment>) -> Comment {
     let model = review(repo);
-    let resolved = resolve_draft(repo.path(), &model, &draft_with(comments, ""));
+    let resolved = resolve_draft(&model, &draft_with(comments, ""));
 
     resolved.comments.into_iter().next().expect("one comment")
 }
@@ -292,7 +296,7 @@ fn records_the_digest_a_file_was_viewed_at() {
     let model = review(&repo);
     let digest = model.files[0].digest.clone();
 
-    let draft = set_viewed(repo.path(), &model, "a.txt", Some(&digest));
+    let draft = set_viewed(repo.store(), &model, "a.txt", Some(&digest));
 
     assert_eq!(draft.viewed.get("a.txt"), Some(&digest));
 }
@@ -303,8 +307,8 @@ fn clears_the_mark_when_given_none() {
     let model = review(&repo);
     let digest = model.files[0].digest.clone();
 
-    set_viewed(repo.path(), &model, "a.txt", Some(&digest));
-    let cleared = set_viewed(repo.path(), &model, "a.txt", None);
+    set_viewed(repo.store(), &model, "a.txt", Some(&digest));
+    let cleared = set_viewed(repo.store(), &model, "a.txt", None);
 
     assert!(cleared.viewed.is_empty());
 }
@@ -315,12 +319,12 @@ fn keeps_the_stale_digest_so_the_ui_can_tell_the_file_moved_on() {
 
     let before = review(&repo);
     let stale = before.files[0].digest.clone();
-    set_viewed(repo.path(), &before, "a.txt", Some(&stale));
+    set_viewed(repo.store(), &before, "a.txt", Some(&stale));
 
     repo.write("a.txt", lines(&["alpha", "GAMMA", "gamma", "delta"]));
     let after = review(&repo);
 
-    assert_eq!(load_draft(repo.path()).viewed.get("a.txt"), Some(&stale));
+    assert_eq!(load_draft(repo.store()).viewed.get("a.txt"), Some(&stale));
     assert_ne!(stale, after.files[0].digest);
 }
 

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::drafts::{draft_dir, empty_draft, save_draft};
+use crate::drafts::{empty_draft, save_draft};
 use crate::fsutil::write_atomic;
 use crate::sides::{read_sides, side_lines};
 use crate::types::{
@@ -48,7 +48,8 @@ fn timestamp_slug(iso: &str) -> String {
     trimmed.replace(':', "-")
 }
 
-fn quote_for(root: &Path, model: &ReviewModel, comment: &Comment) -> Vec<String> {
+fn quote_for(model: &ReviewModel, comment: &Comment) -> Vec<String> {
+    let root = Path::new(&model.repo_root);
     let Some(anchor) = &comment.anchor else {
         return Vec::new();
     };
@@ -124,7 +125,7 @@ fn plural(n: u32) -> &'static str {
     }
 }
 
-pub fn render_markdown(root: &Path, model: &ReviewModel, draft: &Draft) -> String {
+pub fn render_markdown(model: &ReviewModel, draft: &Draft) -> String {
     let short_sha = match &model.base.sha {
         Some(sha) => sha.chars().take(7).collect::<String>(),
         None => "no commits".to_string(),
@@ -199,7 +200,7 @@ pub fn render_markdown(root: &Path, model: &ReviewModel, draft: &Draft) -> Strin
             }
             out.push(String::new());
 
-            let quote = quote_for(root, model, comment);
+            let quote = quote_for(model, comment);
             if quote.is_empty() {
             } else if quote.iter().all(|l| l.trim().is_empty()) {
                 out.push(
@@ -279,21 +280,26 @@ struct ExportedReview<'a> {
     comments: Vec<ExportedComment<'a>>,
 }
 
+pub const REVIEWS_DIR: &str = "reviews";
+pub const LATEST_MARKDOWN: &str = "latest.md";
+
+/// Writes the review into `<dir>/reviews/`, where `dir` is the session's
+/// directory, and clears the session's draft.
 pub fn submit_review(
-    root: &Path,
+    dir: &Path,
     model: &ReviewModel,
     draft: &Draft,
 ) -> std::io::Result<SubmitResult> {
-    let dir = draft_dir(root);
-    std::fs::create_dir_all(&dir)?;
+    let reviews = dir.join(REVIEWS_DIR);
+    std::fs::create_dir_all(&reviews)?;
 
-    let markdown = render_markdown(root, model, draft);
+    let markdown = render_markdown(model, draft);
     let slug = timestamp_slug(&draft.updated_at);
 
-    let markdown_path = dir.join(format!("review-{slug}.md"));
-    let json_path = dir.join(format!("review-{slug}.json"));
-    let latest_markdown_path = dir.join("latest.md");
-    let latest_json_path = dir.join("latest.json");
+    let markdown_path = reviews.join(format!("review-{slug}.md"));
+    let json_path = reviews.join(format!("review-{slug}.json"));
+    let latest_markdown_path = reviews.join(LATEST_MARKDOWN);
+    let latest_json_path = reviews.join("latest.json");
 
     let exported = ExportedReview {
         version: 1,
@@ -308,7 +314,7 @@ pub fn submit_review(
             .map(|comment| ExportedComment {
                 comment,
                 location: location_of(comment),
-                quote: quote_for(root, model, comment),
+                quote: quote_for(model, comment),
             })
             .collect(),
     };
@@ -321,7 +327,7 @@ pub fn submit_review(
     write_atomic(&latest_markdown_path, &markdown)?;
     write_atomic(&latest_json_path, &json)?;
 
-    save_draft(root, &empty_draft());
+    save_draft(dir, &empty_draft());
 
     Ok(SubmitResult {
         markdown_path: markdown_path.to_string_lossy().into_owned(),

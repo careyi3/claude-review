@@ -1,4 +1,4 @@
-use claude_review::git::{parse_porcelain_v2, StatusEntry};
+use claude_review::git::{parse_name_status, parse_porcelain_v2, StatusEntry};
 
 fn entry(
     path: &str,
@@ -75,4 +75,24 @@ fn marks_untracked_entries() {
 #[test]
 fn returns_nothing_for_a_clean_tree() {
     assert!(parse_porcelain_v2("").is_empty());
+}
+
+#[test]
+fn parses_name_status_entries_including_renames() {
+    let raw = "M\0src/a.ts\0R087\0old.ts\0new.ts\0A\0added.ts\0D\0gone.ts\0";
+
+    assert_eq!(
+        parse_name_status(raw),
+        vec![
+            entry("src/a.ts", None, "M", false, false, None),
+            entry("new.ts", Some("old.ts"), "R087", false, false, Some(87)),
+            entry("added.ts", None, "A", false, false, None),
+            entry("gone.ts", None, "D", false, false, None),
+        ]
+    );
+}
+
+#[test]
+fn marks_unmerged_name_status_entries() {
+    assert!(parse_name_status("U\0conflict.ts\0")[0].unmerged);
 }
