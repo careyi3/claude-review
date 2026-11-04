@@ -1,6 +1,6 @@
 [package]
 name = "claude-review-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.82"
 description = "Local diff review tool: review Claude's changes in a browser, leave line comments, hand them back as a structured blob."
